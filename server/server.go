@@ -5,10 +5,12 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"database/sql"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"github.com/peterh/liner"
-	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/crypto/sha3"
 	"io/ioutil"
 	"net"
 	"os"
@@ -25,13 +27,7 @@ var privateKey *rsa.PrivateKey
 
 func main() {
 	loadPrivateKey()
-
-	var err error
-	db, err = sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/c2_operators")
-	if err != nil {
-		panic(err)
-	}
-	defer db.Close()
+	initDB()
 
 	cert, err := tls.LoadX509KeyPair("certs/server.crt", "certs/server.key")
 	if err != nil {
@@ -63,6 +59,14 @@ func loadPrivateKey() {
 	}
 
 	privateKey, err = rsa.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func initDB() {
+	var err error
+	db, err = sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/c2")
 	if err != nil {
 		panic(err)
 	}
